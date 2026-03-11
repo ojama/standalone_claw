@@ -32,7 +32,7 @@ import { execFileSync } from 'child_process';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { mkdir } from 'fs/promises';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, '..');
@@ -67,70 +67,77 @@ if (targets.length === 0) {
 }
 
 // ---------------------------------------------------------------------------
-// Resolve tool binaries
+// Verify required packages are installed
 // ---------------------------------------------------------------------------
-const esbuildBin = path.join(root, 'node_modules', '.bin', 'esbuild');
-const pkgBin = path.join(root, 'node_modules', '.bin', 'pkg');
+const esbuildPkg = path.join(root, 'node_modules', 'esbuild', 'package.json');
+const pkgBinJs = path.join(root, 'node_modules', '@yao-pkg', 'pkg', 'lib-es5', 'bin.js');
 
-for (const [name, bin] of [['esbuild', esbuildBin], ['pkg', pkgBin]]) {
-  if (!existsSync(bin)) {
-    process.stderr.write(`${name} binary not found. Run \`npm install\` first.\n`);
-    process.exit(1);
-  }
+if (!existsSync(esbuildPkg)) {
+  process.stderr.write('esbuild package not found. Run `npm install` first.\n');
+  process.exit(1);
+}
+if (!existsSync(pkgBinJs)) {
+  process.stderr.write('@yao-pkg/pkg not found. Run `npm install` first.\n');
+  process.exit(1);
 }
 
 // Ensure dist/ exists
 await mkdir(path.join(root, 'dist'), { recursive: true });
 
 // ---------------------------------------------------------------------------
-// Step 1: Bundle openclaw + npm deps to a single CJS module with esbuild.
+// Step 1: Bundle openclaw + npm deps to a single CJS module.
+//
+// We use the esbuild JavaScript API (not the binary) so the build works on
+// every platform regardless of which native esbuild binary is installed.
 //
 // Packages marked as external are either:
 //   - Native binary addons (contain .node files) that must be loaded from disk
 //   - Packages with top-level await or other CJS-incompatible constructs
 //
-// NOTE: We intentionally do NOT use --external:"*.node" here because that
-// glob also matches JavaScript files whose names happen to end in ".node"
-// (e.g. grammy's platform.node.js), causing incorrect externalization.
+// NOTE: We intentionally do NOT use the "*.node" glob because that also
+// matches JavaScript files whose names end in ".node" (e.g. grammy's
+// platform.node.js), causing incorrect externalization.
 // ---------------------------------------------------------------------------
 const bundlePath = path.join(root, 'src', 'openclaw-bundle.cjs');
 const openclawEntry = path.join(root, 'node_modules', 'openclaw', 'dist', 'entry.js');
 
 console.log('\nStep 1: Bundling openclaw + npm deps with esbuild…');
-execFileSync(
-  esbuildBin,
-  [
-    openclawEntry,
-    '--bundle',
-    '--platform=node',
-    '--format=cjs',
-    `--outfile=${bundlePath}`,
-    '--log-level=warning',
+
+// Import esbuild JS API — works on all platforms without spawning a subprocess.
+const esbuild = await import(pathToFileURL(path.join(root, 'node_modules', 'esbuild', 'lib', 'main.js')).href);
+
+await esbuild.build({
+  entryPoints: [openclawEntry],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  outfile: bundlePath,
+  logLevel: 'warning',
+  external: [
     // Native binary addon packages — must be loaded from real filesystem
-    '--external:@img/*',
-    '--external:@lydell/*',
-    '--external:@mariozechner/clipboard-*',
-    '--external:@napi-rs/*',
-    '--external:@node-llama-cpp',
-    '--external:@node-llama-cpp/*',
-    '--external:@reflink/*',
-    '--external:@snazzah/*',
-    '--external:koffi',
+    '@img/*',
+    '@lydell/*',
+    '@mariozechner/clipboard-*',
+    '@napi-rs/*',
+    '@node-llama-cpp',
+    '@node-llama-cpp/*',
+    '@reflink/*',
+    '@snazzah/*',
+    'koffi',
     // node-llama-cpp main package uses top-level await (cannot bundle to CJS)
-    '--external:node-llama-cpp',
+    'node-llama-cpp',
     // Optional media / voice packages not required for core gateway
-    '--external:ffmpeg-static',
-    '--external:opusscript',
-    '--external:@discordjs/opus',
-    '--external:sodium-native',
+    'ffmpeg-static',
+    'opusscript',
+    '@discordjs/opus',
+    'sodium-native',
     // playwright-core requires chromium-bidi which is not installed
-    '--external:playwright',
-    '--external:playwright-core',
-    '--external:chromium-bidi',
-    '--external:chromium-bidi/*',
+    'playwright',
+    'playwright-core',
+    'chromium-bidi',
+    'chromium-bidi/*',
   ],
-  { stdio: 'inherit', cwd: root }
-);
+});
 
 // ---------------------------------------------------------------------------
 // Step 2: Post-process the bundle to fix two esbuild CJS quirks.
@@ -172,7 +179,12 @@ writeFileSync(bundlePath, bundle, 'utf8');
 console.log(`Bundle written: src/openclaw-bundle.cjs (${(bundle.length / 1024 / 1024).toFixed(1)} MB)`);
 
 // ---------------------------------------------------------------------------
-// Step 3: Build each target executable with pkg
+// Step 3: Build each target executable with pkg.
+//
+// We invoke pkg's bin.js via process.execPath (the current Node.js binary)
+// rather than trying to execute it as a standalone file.  This avoids
+// spawnSync failures on platforms where the shebang or PATH resolution
+// behaves differently (Windows cmd, restricted CI environments, etc.).
 // ---------------------------------------------------------------------------
 for (const target of targets) {
   const outputPath = path.join(root, 'dist', target.output);
@@ -180,8 +192,9 @@ for (const target of targets) {
   console.log(`\nStep 3 [${target.name}]: Packaging with pkg → dist/${target.output} …`);
 
   execFileSync(
-    pkgBin,
+    process.execPath,
     [
+      pkgBinJs,
       path.join(root, 'src', 'main.cjs'),
       '--target', target.triple,
       '--output', outputPath,
