@@ -29,8 +29,12 @@
  */
 
 import { execFileSync } from 'child_process';
-import { existsSync, readFileSync, writeFileSync } from 'fs';
-import { mkdir } from 'fs/promises';
+import { createHash } from 'node:crypto';
+import { createReadStream, createWriteStream, existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs';
+import { chmod, mkdir } from 'fs/promises';
+import os from 'node:os';
+import { pipeline } from 'node:stream/promises';
+import { Readable } from 'node:stream';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
@@ -71,6 +75,7 @@ if (targets.length === 0) {
 // ---------------------------------------------------------------------------
 const esbuildPkg = path.join(root, 'node_modules', 'esbuild', 'package.json');
 const pkgBinJs = path.join(root, 'node_modules', '@yao-pkg', 'pkg', 'lib-es5', 'bin.js');
+const pkgFetchRoot = path.join(root, 'node_modules', '@yao-pkg', 'pkg-fetch');
 
 if (!existsSync(esbuildPkg)) {
   process.stderr.write('esbuild package not found. Run `npm install` first.\n');
@@ -81,8 +86,138 @@ if (!existsSync(pkgBinJs)) {
   process.exit(1);
 }
 
+// pkg-fetch metadata used by prefetchPkgBinary() below.
+const pkgFetchPkgJson = JSON.parse(readFileSync(path.join(pkgFetchRoot, 'package.json'), 'utf8'));
+// Derive the GitHub release tag: '3.5.32' → 'v3.5'
+const pkgFetchTag = `v${pkgFetchPkgJson.version.split('.').slice(0, 2).join('.')}`;
+const pkgFetchPatches = JSON.parse(readFileSync(path.join(pkgFetchRoot, 'patches', 'patches.json'), 'utf8'));
+const pkgFetchExpectedShas = JSON.parse(readFileSync(path.join(pkgFetchRoot, 'lib-es5', 'expected-shas.json'), 'utf8'));
+
 // Ensure dist/ exists
 await mkdir(path.join(root, 'dist'), { recursive: true });
+
+// ---------------------------------------------------------------------------
+// Helper: resolve the exact Node.js version pkg-fetch maps a range to.
+// Mirrors satisfyingNodeVersion() in @yao-pkg/pkg-fetch/lib-es5/index.js.
+// ---------------------------------------------------------------------------
+function resolvePkgNodeVersion(nodeRange) {
+  const major = nodeRange.replace(/^node/, ''); // 'node22' → '22'
+  const versions = Object.keys(pkgFetchPatches)
+    .filter(v => v.startsWith(`v${major}.`))
+    .sort((a, b) => {
+      const pa = a.slice(1).split('.').map(Number);
+      const pb = b.slice(1).split('.').map(Number);
+      for (let i = 0; i < 3; i++) {
+        if (pa[i] !== pb[i]) return pa[i] - pb[i];
+      }
+      return 0;
+    });
+  const version = versions[versions.length - 1];
+  if (!version) throw new Error(`No pkg-fetch node version satisfies '${nodeRange}'`);
+  return version; // e.g. 'v22.22.0'
+}
+
+// ---------------------------------------------------------------------------
+// Helper: SHA-256 hex digest of a file.
+// ---------------------------------------------------------------------------
+function sha256File(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256');
+    createReadStream(filePath)
+      .on('data', d => hash.update(d))
+      .on('end', () => resolve(hash.digest('hex')))
+      .on('error', reject);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Helper: pre-fetch a pkg base Node.js binary into the pkg-cache directory.
+//
+// @yao-pkg/pkg-fetch downloads pre-built Node.js binaries using node-fetch v2.
+// On some Windows systems running Node.js 22 (which uses OpenSSL 3.x),
+// node-fetch v2 can fail SSL/TLS handshakes, causing the download to silently
+// return false.  When the download fails, pkg-fetch falls back to building
+// Node.js from source — which requires the Unix 'patch' command.  That command
+// is not available on Windows by default, producing the error:
+//   Error: spawnSync patch ENOENT
+//
+// We fix this by pre-downloading the binary ourselves using Node.js 22's
+// native fetch (backed by undici, fully compatible with OpenSSL 3.x) and
+// placing the file in exactly the path that pkg-fetch's localPlace() function
+// constructs.  When pkg-fetch runs, it finds the pre-cached binary, verifies
+// the SHA-256 hash, and skips both the download and the source build.
+// ---------------------------------------------------------------------------
+async function prefetchPkgBinary(platform, arch) {
+  const nodeVersion = resolvePkgNodeVersion(NODE_VERSION); // e.g. 'v22.22.0'
+  const binaryName = `node-${nodeVersion}-${platform}-${arch}`;
+  const expectedSha = pkgFetchExpectedShas[binaryName];
+  if (!expectedSha) {
+    throw new Error(
+      `No expected SHA for '${binaryName}' in @yao-pkg/pkg-fetch@${pkgFetchPkgJson.version}. ` +
+      'Try updating the @yao-pkg/pkg-fetch dependency.'
+    );
+  }
+
+  // Mirror localPlace({ from: 'fetched', … }) from @yao-pkg/pkg-fetch/lib-es5/places.js.
+  // Cache path: {PKG_CACHE_PATH|~/.pkg-cache}/{tag}/fetched-{version}-{platform}-{arch}
+  const cacheBase = process.env.PKG_CACHE_PATH || path.join(os.homedir(), '.pkg-cache');
+  const cacheDir = path.join(cacheBase, pkgFetchTag);
+  const cachedBinary = path.join(cacheDir, `fetched-${nodeVersion}-${platform}-${arch}`);
+
+  // If already cached and hash matches, nothing to do.
+  if (existsSync(cachedBinary)) {
+    const existingSha = await sha256File(cachedBinary);
+    if (existingSha === expectedSha) {
+      process.stdout.write(`  ✓ ${binaryName} (already cached)\n`);
+      return;
+    }
+    process.stdout.write(`  ✗ ${binaryName} (stale/corrupt; re-downloading)\n`);
+    unlinkSync(cachedBinary);
+  }
+
+  const url = `https://github.com/yao-pkg/pkg-fetch/releases/download/${pkgFetchTag}/${binaryName}`;
+  process.stdout.write(`  ↓ ${binaryName}…\n`);
+
+  let response;
+  try {
+    response = await fetch(url);
+  } catch (err) {
+    throw new Error(
+      `Cannot download pkg base binary '${binaryName}'.\n` +
+      `  URL: ${url}\n` +
+      `  Error: ${err.message}\n` +
+      '  Tip: If you are behind a proxy, set the HTTPS_PROXY environment variable.'
+    );
+  }
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} fetching ${url}`);
+  }
+
+  await mkdir(cacheDir, { recursive: true });
+  const tempPath = `${cachedBinary}.tmp`;
+
+  // Stream response body to disk (binary is ~60 MB; avoid loading into memory).
+  await pipeline(Readable.fromWeb(response.body), createWriteStream(tempPath));
+
+  // Verify SHA-256 before committing to cache.
+  const downloadedSha = await sha256File(tempPath);
+  if (downloadedSha !== expectedSha) {
+    unlinkSync(tempPath);
+    throw new Error(
+      `SHA256 mismatch for '${binaryName}': ` +
+      `expected ${expectedSha}, got ${downloadedSha}`
+    );
+  }
+
+  renameSync(tempPath, cachedBinary);
+
+  // Mark executable on non-Windows (mirrors plusx() in pkg-fetch/utils.js).
+  if (process.platform !== 'win32') {
+    await chmod(cachedBinary, 0o755);
+  }
+
+  process.stdout.write(`  ✓ ${binaryName}\n`);
+}
 
 // ---------------------------------------------------------------------------
 // Step 1: Bundle openclaw + npm deps to a single CJS module.
@@ -177,6 +312,24 @@ console.log(`  ✓ Patched ${importMetaCount} import.meta instance(s) with __fil
 
 writeFileSync(bundlePath, bundle, 'utf8');
 console.log(`Bundle written: src/openclaw-bundle.cjs (${(bundle.length / 1024 / 1024).toFixed(1)} MB)`);
+
+// ---------------------------------------------------------------------------
+// Step 3 pre-flight: Pre-fetch pkg base Node.js binaries.
+//
+// @yao-pkg/pkg-fetch uses node-fetch v2 to download the pre-built Node.js
+// binaries it needs.  On some Windows machines running Node.js 22 (OpenSSL
+// 3.x), node-fetch v2 can fail TLS handshakes silently, causing a fallback to
+// building Node.js from source which requires the Unix 'patch' command.
+// We pre-download each required binary with Node.js 22's native fetch
+// (undici-backed, OpenSSL-3-compatible) into the pkg-cache so pkg-fetch finds
+// the binary already cached and skips both the download and the source build.
+// ---------------------------------------------------------------------------
+console.log('\nStep 3 (pre-flight): Pre-fetching pkg base Node.js binaries…');
+for (const target of targets) {
+  // triple format: 'node22-win-x64', 'node22-macos-arm64', etc.
+  const [, platform, arch] = target.triple.split('-');
+  await prefetchPkgBinary(platform, arch);
+}
 
 // ---------------------------------------------------------------------------
 // Step 3: Build each target executable with pkg.
